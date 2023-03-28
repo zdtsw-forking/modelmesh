@@ -61,6 +61,12 @@ import com.ibm.watson.modelmesh.ModelRecord.FailureInfo;
 import com.ibm.watson.modelmesh.TypeConstraintManager.ProhibitedTypeSet;
 import com.ibm.watson.modelmesh.clhm.ConcurrentLinkedHashMap;
 import com.ibm.watson.modelmesh.clhm.ConcurrentLinkedHashMap.EvictionListenerWithTime;
+import com.ibm.watson.modelmesh.payload.AsyncPayloadProcessor;
+import com.ibm.watson.modelmesh.payload.CompositePayloadProcessor;
+import com.ibm.watson.modelmesh.payload.LoggingPayloadProcessor;
+import com.ibm.watson.modelmesh.payload.MatchingPayloadProcessor;
+import com.ibm.watson.modelmesh.payload.PayloadProcessor;
+import com.ibm.watson.modelmesh.payload.RemotePayloadProcessor;
 import com.ibm.watson.modelmesh.thrift.ApplierException;
 import com.ibm.watson.modelmesh.thrift.BaseModelMeshService;
 import com.ibm.watson.modelmesh.thrift.InternalException;
@@ -101,6 +107,7 @@ import java.lang.management.MemoryMXBean;
 import java.lang.management.MemoryUsage;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.net.URI;
 import java.nio.channels.ClosedByInterruptException;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
@@ -209,9 +216,9 @@ public abstract class ModelMesh extends ThriftService
     protected /*final*/ long defaultAssumeLoadedAfterMs;
 
     // time after which loading failure records expire (allowing for re-attempts)
-    public final long LOAD_FAILURE_EXPIRY_MS = getLongParameter(LOAD_FAILURE_EXPIRY_ENV_VAR, 600_000L); // default 10mins
+    public final long LOAD_FAILURE_EXPIRY_MS = getLongParameter(LOAD_FAILURE_EXPIRY_ENV_VAR, 900_000L); // default 15mins
     // shorter expiry time for "in use" models (receiving recent requests)
-    public final long IN_USE_LOAD_FAILURE_EXPIRY_MS = (LOAD_FAILURE_EXPIRY_MS * 2) / 3;
+    public final long IN_USE_LOAD_FAILURE_EXPIRY_MS = LOAD_FAILURE_EXPIRY_MS / 2;
     public static final int MAX_LOAD_FAILURES = 3;
     // if unable to invoke in this many places, don't continue to load
     public static final int MAX_LOAD_LOCATIONS = 5;
@@ -418,6 +425,40 @@ public abstract class ModelMesh extends ThriftService
         } catch (NumberFormatException nfe) {
             throw new NumberFormatException(
                     PRESTOP_SERVER_PORT_ENV_VAR + " is not a valid port number: " + preStopPort);
+        }
+    }
+
+    private PayloadProcessor initPayloadProcessor() {
+        String payloadProcessorsDefinitions = getStringParameter(MM_PAYLOAD_PROCESSORS, null);
+        logger.info("Parsing PayloadProcessor definition '{}'", payloadProcessorsDefinitions);
+        if (payloadProcessorsDefinitions != null && payloadProcessorsDefinitions.length() > 0) {
+            List<PayloadProcessor> payloadProcessors = new ArrayList<>();
+            for (String processorDefinition : payloadProcessorsDefinitions.split(" ")) {
+                try {
+                    URI uri = URI.create(processorDefinition);
+                    String processorName = uri.getScheme();
+                    PayloadProcessor processor = null;
+                    String modelId = uri.getQuery();
+                    String method = uri.getFragment();
+                    if ("http".equals(processorName)) {
+                        processor = new RemotePayloadProcessor(uri);
+                    } else if ("logger".equals(processorName)) {
+                        processor = new LoggingPayloadProcessor();
+                    }
+                    if (processor != null) {
+                        MatchingPayloadProcessor p = MatchingPayloadProcessor.from(modelId, method, processor);
+                        payloadProcessors.add(p);
+                        logger.info("Added PayloadProcessor {}", p.getName());
+                    }
+                } catch (IllegalArgumentException iae) {
+                    logger.error("Unable to parse PayloadProcessor URI definition {}", processorDefinition);
+                }
+            }
+            return new AsyncPayloadProcessor(new CompositePayloadProcessor(payloadProcessors), 1, MINUTES,
+                                             Executors.newScheduledThreadPool(getIntParameter(MM_PAYLOAD_PROCESSORS_THREADS, 2)),
+                                             getIntParameter(MM_PAYLOAD_PROCESSORS_CAPACITY, 64));
+        } else {
+            return null;
         }
     }
 
@@ -854,10 +895,11 @@ public abstract class ModelMesh extends ThriftService
             }
 
             LogRequestHeaders logHeaders = LogRequestHeaders.getConfiguredLogRequestHeaders();
+            PayloadProcessor payloadProcessor = initPayloadProcessor();
 
             grpcServer = new ModelMeshApi((SidecarModelMesh) this, vModelManager, GRPC_PORT, keyCertFile, privateKeyFile,
                     privateKeyPassphrase, clientAuth, caCertFiles, maxGrpcMessageSize, maxGrpcHeadersSize,
-                    maxGrpcConnectionAge, maxGrpcConnectionAgeGrace, logHeaders);
+                    maxGrpcConnectionAge, maxGrpcConnectionAgeGrace, logHeaders, payloadProcessor);
         }
 
         if (grpcServer != null) {
@@ -883,7 +925,9 @@ public abstract class ModelMesh extends ThriftService
 //    }
 
     // "type" or "type:p1=v1;p2=v2;...;pn=vn"
-    private static final Pattern METRICS_CONFIG_PATT = Pattern.compile("([a-z]+)(:\\w+=[^;]+(?:;\\w+=[^;]+)*)?");
+    private static final Pattern METRICS_CONFIG_PATT = Pattern.compile("([a-z;]+)(:\\w+=[^;]+(?:;\\w+=[^;]+)*)?");
+    // "metric_name" or "metric:name;l1=v1,l2=v2,...,ln=vn,"
+    private static final Pattern CUSTOM_METRIC_CONFIG_PATT = Pattern.compile("([a-z_:]+);(\\w+=[^;]+(?:;\\w+=[^,]+)*)?");
 
     private static Metrics setUpMetrics() throws Exception {
         if (System.getenv("MM_METRICS_STATSD_PORT") != null || System.getenv("MM_METRICS_PROMETHEUS_PORT") != null) {
@@ -916,12 +960,38 @@ public abstract class ModelMesh extends ThriftService
                 params.put(kv[0], kv[1]);
             }
         }
+        String infoMetricConfig = getStringParameter(MMESH_CUSTOM_ENV_VAR, null);
+        Map<String, String> infoMetricParams;
+        if (infoMetricConfig == null) {
+            logger.info("{} returned null", MMESH_CUSTOM_ENV_VAR);
+            infoMetricParams = null;
+        } else {
+            logger.info("{} set to \"{}\"", MMESH_CUSTOM_ENV_VAR, infoMetricConfig);
+            Matcher infoMetricMatcher = CUSTOM_METRIC_CONFIG_PATT.matcher(infoMetricConfig);
+            if (!infoMetricMatcher.matches()) {
+                throw new Exception("Invalid metrics configuration provided in env var " + MMESH_CUSTOM_ENV_VAR + ": \""
+                                    + infoMetricConfig + "\"");
+            }
+            String infoMetricName = infoMetricMatcher.group(1);
+            String infoMetricParamString = infoMetricMatcher.group(2);
+            infoMetricParams = new HashMap<>();
+            infoMetricParams.put("metric_name", infoMetricName);
+            for (String infoMetricParam : infoMetricParamString.substring(0).split(",")) {
+                String[] kv = infoMetricParam.split("=");
+                String value = System.getenv(kv[1]);
+                if (value == null) {
+                    throw new Exception("Env var " + kv[1] + " is unresolved in " + MMESH_CUSTOM_ENV_VAR + ": \""
+                            + infoMetricConfig + "\"");
+                }
+                infoMetricParams.put(kv[0], value);
+            }
+        }
         try {
             switch (type.toLowerCase()) {
             case "statsd":
                 return new Metrics.StatsDMetrics(params);
             case "prometheus":
-                return new Metrics.PrometheusMetrics(params);
+                return new Metrics.PrometheusMetrics(params, infoMetricParams);
             case "disabled":
                 logger.info("Metrics publishing is disabled (env var {}={})", MMESH_METRICS_ENV_VAR, metricsConfig);
                 return Metrics.NO_OP_METRICS;
@@ -2197,7 +2267,7 @@ public abstract class ModelMesh extends ThriftService
             }
         }
 
-        private void waitForSpaceToLoad(int required) throws Exception {
+        private void waitForSpaceToLoad(final int required) throws Exception {
             //assert unloadManager != null;
             // here state == WAITING; we wait if necessary for cache space to become available
             //  -- specifically that we can add back our prior subtraction from the aggregate
@@ -2372,7 +2442,10 @@ public abstract class ModelMesh extends ThriftService
 
         // Called at most once, by the thread which moved the state to FAILED.
         // unloadDelay == -1L means load wasn't attempted so don't unload at all
-        private boolean failed(Throwable t, long unloadDelay) {
+        private void failed(Throwable t, long unloadDelay) {
+            if (state != FAILED) {
+                return;
+            }
 
             boolean isShuttingDown = shuttingDown;
             if (!isShuttingDown) {
@@ -2382,9 +2455,21 @@ public abstract class ModelMesh extends ThriftService
             int weightBefore;
             synchronized (CacheEntry.this) {
                 weightBefore = getWeight();
-                updateWeight(FAILED_WEIGHT);
-                if (!isShuttingDown && unloadDelay >= 0) {
-                    triggerUnload(weightBefore - FAILED_WEIGHT, unloadDelay);
+                int weightReduction = weightBefore - FAILED_WEIGHT;
+                if (weightReduction != 0) {
+                    if (unloadManager != null) {
+                        // Though this method is written the new entry adjustment, the accounting
+                        // is identical to what we need here when reducing the size of the failed
+                        // entry and triggering an unload tied to that space reduction.
+                        unloadManager.adjustNewEntrySpaceRequest(-weightReduction, this, false);
+                        if (!isShuttingDown && unloadDelay >= 0) {
+                            triggerUnload(weightReduction, unloadDelay);
+                        } else {
+                            unloadManager.unloadComplete(weightReduction, true, modelId);
+                        }
+                    } else {
+                        updateWeight(FAILED_WEIGHT);
+                    }
                 }
             }
 
@@ -2393,7 +2478,7 @@ public abstract class ModelMesh extends ThriftService
                 ModelRecord mr = registry.getOrStrongIfAbsent(modelId);
                 while (true) {
                     if (mr == null) {
-                        return true; // deleted while loading
+                        return; // deleted while loading
                     }
                     if (lastUsed <= 0L) {
                         lastUsed = mr.getLastUsed();
@@ -2438,7 +2523,6 @@ public abstract class ModelMesh extends ThriftService
                                  + modelId, e);
                 }
             }
-            return true;
         }
 
         // Used when there is a failure updating the KV registry prior to a load attempt
@@ -3609,10 +3693,12 @@ public abstract class ModelMesh extends ThriftService
                                             ModelLoadException mle = newModelLoadException(
                                                     "KV store error attempting to prune model record: " + e,
                                                     KVSTORE_LOAD_FAILURE, e);
-                                            CacheEntry<?> failedEntry = new CacheEntry<>(modelId, mr, mle);
-                                            cacheEntry = unloadManager != null
-                                                ? unloadManager.insertFailedPlaceholderEntry(modelId, failedEntry, mr.getLastUsed())
-                                                : runtimeCache.putIfAbsent(modelId, failedEntry, mr.getLastUsed());
+                                            if (io.grpc.Status.fromThrowable(e).getCode() != Code.CANCELLED) {
+                                                CacheEntry<?> failedEntry = new CacheEntry<>(modelId, mr, mle);
+                                                cacheEntry = unloadManager != null
+                                                        ? unloadManager.insertFailedPlaceholderEntry(modelId, failedEntry, mr.getLastUsed())
+                                                        : runtimeCache.putIfAbsent(modelId, failedEntry, mr.getLastUsed());
+                                            }
                                             if (cacheEntry == null) {
                                                 throw mle;
                                             }
@@ -5223,7 +5309,7 @@ public abstract class ModelMesh extends ThriftService
             || ((ModelLoadException) failure).getTimeout() != KVSTORE_LOAD_FAILURE) {
             // We assume that this is an expired entry yet to be cleaned up
             if (ce.remove()) {
-                logger.info("Removed kv-store failure cache entry for model " + ce.modelId);
+                logger.info("Removed residual failed cache entry for model " + ce.modelId);
             }
             return mr;
         }
@@ -5315,11 +5401,20 @@ public abstract class ModelMesh extends ThriftService
                 long oldest = runtimeCache.oldestTime();
                 long cap = runtimeCache.capacity(), used = runtimeCache.weightedSize();
                 int count = runtimeCache.size(); //TODO maybe don't get every time
+                int unloadBufferWeight = -1, totalUnloadingWeight = -1;
+                long totalCacheOccupancy = -1;
                 if (unloadManager != null) {
+                    runtimeCache.getEvictionLock().lock();
+                    try {
+                        unloadBufferWeight = unloadManager.getUnloadBufferWeight();
+                        totalUnloadingWeight = unloadManager.getTotalUnloadingWeight();
+                        totalCacheOccupancy = unloadManager.getTotalModelCacheOccupancy();
+                    } finally {
+                        runtimeCache.getEvictionLock().unlock();;
+                    }
                     // remove unloading buffer weight from published values
-                    int weight = unloadManager.getUnloadBufferWeight();
-                    cap -= weight;
-                    used -= weight;
+                    cap -= unloadBufferWeight;
+                    used -= unloadBufferWeight;
                     count--;
                 }
                 if (oldest == -1L) {
@@ -5395,7 +5490,13 @@ public abstract class ModelMesh extends ThriftService
                     InstanceRecord existRec = instanceInfo.conditionalSetAndGet(instanceId, curRec, sessionId);
                     if (existRec == curRec) {
                         curRec.setActionableUpdate();
-                        logger.info("Published new instance record: " + curRec);
+                        String message = "Published new instance record: " + curRec;
+                        if (unloadBufferWeight != -1) {
+                            // Also log some internal values to help identify cache accounting anomalies
+                            message += ", UBW=" + unloadBufferWeight + ", TUW=" + totalUnloadingWeight
+                                    + ", TCO=" + totalCacheOccupancy;
+                        }
+                        logger.info(message);
                         lastPublished = now;
                         // our own record in clusterState will subsequently be
                         // updated via the instanceInfo listener.
@@ -5982,7 +6083,10 @@ public abstract class ModelMesh extends ThriftService
                                     }
                                 }
                                 j++;
-                                if (loaded && !remLoaded) {
+                                if (remFailed && ce != null && ce.isFailed()) {
+                                    // Also remove expired failure records from local cache
+                                    ce.remove();
+                                } else if (loaded && !remLoaded) {
                                     if (lastUsed <= 0L) {
                                         lastUsed = runtimeCache.getLastUsedTime(modelId);
                                     }
@@ -6027,7 +6131,7 @@ public abstract class ModelMesh extends ThriftService
                                     weightRemoved += weight;
                                 }
                             } catch (Exception e) {
-                                logger.error("Janitor exception while scaling copies"
+                                logger.error("Janitor exception while scaling down copies"
                                              + (modelId != null ? " for model " + modelId : ""), e);
                             }
                         }
