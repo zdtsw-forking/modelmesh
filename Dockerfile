@@ -88,6 +88,7 @@ RUN true \
 ENV JAVA_HOME=/usr/lib/jvm/jre-17-openjdk
 
 COPY --from=build /build/target/dockerhome/ /opt/kserve/mmesh/
+COPY version /etc/modelmesh-version
 
 # Make this the current directory when starting the container
 WORKDIR /opt/kserve/mmesh
